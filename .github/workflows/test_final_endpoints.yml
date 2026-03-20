@@ -1,0 +1,24 @@
+name: Woolworths Final Endpoint Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install curl-cffi
+
+      - name: Run final endpoint probe
+        run: python test_final_endpoints.py
