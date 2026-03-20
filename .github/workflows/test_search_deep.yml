@@ -1,0 +1,23 @@
+name: Woolworths Search API Deep Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install curl-cffi
+
+      - name: Run deep probe
+        run: python test_search_api_deep.py
