@@ -1,0 +1,26 @@
+name: UC + SeleniumWire Scraper Feasibility Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
+        run: pip install undetected-chromedriver selenium-wire
+
+      - name: Run UC scraper feasibility test
+        run: python test_uc_scraper.py
