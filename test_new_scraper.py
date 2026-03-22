@@ -1,6 +1,8 @@
 """
-Test: new Woolworths scraper (expanded 115-term search, 3 pages/term).
-Validates that the scraper finds specials and the filter (WasPrice > Price) works.
+Test: optimised Woolworths scraper
+- asyncio.Semaphore(16) instead of fixed batches of 8
+- Adaptive paging: pages 2-3 only for terms that yielded specials on page 1
+- Filter: WasPrice > Price (IsHalfPrice is deprecated)
 """
 
 import asyncio
@@ -8,7 +10,7 @@ import time
 from curl_cffi.requests import AsyncSession
 
 BASE        = "https://www.woolworths.com.au"
-CONCURRENCY = 8
+CONCURRENCY = 16
 TIMEOUT     = 20
 PAGES_PER_TERM = 3
 
@@ -56,75 +58,83 @@ SEARCH_TERMS = [
 ]
 
 
-async def fetch_page(session, term, page):
-    try:
-        r = await session.get(
-            f"{BASE}/apis/ui/Search/products",
-            params={
-                "searchTerm": term,
-                "pageNumber": page,
-                "pageSize":   36,
-                "sortType":   "TraderRelevance",
-                "isFeatured": "false",
-            },
-            headers=HEADERS,
-            timeout=TIMEOUT,
-        )
-        if r.status_code != 200:
+async def fetch_page(session, sem, term, page):
+    async with sem:
+        try:
+            r = await session.get(
+                f"{BASE}/apis/ui/Search/products",
+                params={"searchTerm": term, "pageNumber": page, "pageSize": 36,
+                        "sortType": "TraderRelevance", "isFeatured": "false"},
+                headers=HEADERS, timeout=TIMEOUT,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            outer = data.get("Products") or []
+            flat = []
+            for item in outer:
+                inner = item.get("Products") or []
+                if inner: flat.extend(inner)
+                elif item.get("Stockcode"): flat.append(item)
+            return flat
+        except Exception:
             return []
-        data = r.json()
-        outer = data.get("Products") or []
-        flat = []
-        for item in outer:
-            inner = item.get("Products") or []
-            if inner:
-                flat.extend(inner)
-            elif item.get("Stockcode"):
-                flat.append(item)
-        return flat
-    except Exception as e:
-        return []
+
+
+def is_special(item):
+    was = item.get("WasPrice"); price = item.get("Price")
+    return bool(was and price and float(was) > 0 and float(price) > 0 and float(was) > float(price))
 
 
 async def run():
     seen = set()
     products = []
-    tasks = [(term, page) for term in SEARCH_TERMS for page in range(1, PAGES_PER_TERM + 1)]
-
-    print(f"Total API calls planned: {len(tasks)}")
+    sem = asyncio.Semaphore(CONCURRENCY)
 
     async with AsyncSession(impersonate="chrome124") as session:
-        for i in range(0, len(tasks), CONCURRENCY):
-            batch = tasks[i:i + CONCURRENCY]
-            results = await asyncio.gather(
-                *[fetch_page(session, term, page) for term, page in batch],
+        # Phase 1: all page-1s concurrently
+        p1_start = time.time()
+        page1_results = await asyncio.gather(
+            *[fetch_page(session, sem, term, 1) for term in SEARCH_TERMS],
+            return_exceptions=True,
+        )
+        print(f"Phase 1 done in {time.time()-p1_start:.1f}s ({len(SEARCH_TERMS)} calls)")
+
+        productive = []
+        for term, items in zip(SEARCH_TERMS, page1_results):
+            if isinstance(items, Exception) or not items: continue
+            had = False
+            for item in items:
+                if not is_special(item): continue
+                had = True
+                sc = item.get("Stockcode")
+                if sc in seen: continue
+                if sc: seen.add(sc)
+                products.append(item)
+            if had: productive.append(term)
+
+        print(f"After p1: {len(products)} specials, {len(productive)}/{len(SEARCH_TERMS)} terms productive")
+
+        # Phase 2: pages 2-3 for productive terms only
+        deeper = [(t, p) for t in productive for p in range(2, PAGES_PER_TERM+1)]
+        if deeper:
+            p2_start = time.time()
+            deeper_results = await asyncio.gather(
+                *[fetch_page(session, sem, t, p) for t, p in deeper],
                 return_exceptions=True,
             )
-            for items in results:
-                if isinstance(items, Exception) or not items:
-                    continue
+            print(f"Phase 2 done in {time.time()-p2_start:.1f}s ({len(deeper)} calls, skipped {(len(SEARCH_TERMS)-len(productive))*(PAGES_PER_TERM-1)} calls)")
+            for items in deeper_results:
+                if isinstance(items, Exception) or not items: continue
                 for item in items:
-                    was   = item.get("WasPrice")
-                    price = item.get("Price")
-                    has_discount = (
-                        was and price
-                        and float(was) > 0
-                        and float(price) > 0
-                        and float(was) > float(price)
-                    )
-                    if not has_discount:
-                        continue
+                    if not is_special(item): continue
                     sc = item.get("Stockcode")
-                    if sc in seen:
-                        continue
-                    if sc:
-                        seen.add(sc)
+                    if sc in seen: continue
+                    if sc: seen.add(sc)
                     products.append(item)
 
-            # Progress every 10 batches
-            if (i // CONCURRENCY) % 10 == 0:
-                print(f"  Batch {i//CONCURRENCY+1}/{len(tasks)//CONCURRENCY+1} done — {len(products)} specials so far")
-
+    total_calls = len(SEARCH_TERMS) + len(deeper)
+    print(f"Total API calls: {total_calls} (vs {len(SEARCH_TERMS)*PAGES_PER_TERM} without adaptive paging)")
     return products
 
 
@@ -134,17 +144,15 @@ if __name__ == "__main__":
     elapsed = time.time() - start
 
     print(f"\n{'='*50}")
-    print(f"RESULT: {len(products)} unique specials found in {elapsed:.1f}s")
+    print(f"RESULT: {len(products)} unique specials in {elapsed:.1f}s")
     print(f"{'='*50}")
 
     if products:
-        print("\nSample (first 10):")
-        for p in products[:10]:
-            was = p.get("WasPrice")
-            now = p.get("Price")
-            pct = round((float(was) - float(now)) / float(was) * 100, 1) if was and now else 0
-            print(f"  {p.get('Name','?')[:55]}")
-            print(f"    ${now} now  |  was ${was}  |  {pct}% off  |  IsHalfPrice={p.get('IsHalfPrice')}  |  IsOnSpecial={p.get('IsOnSpecial')}")
+        print("\nSample (first 5):")
+        for p in products[:5]:
+            was = p.get("WasPrice"); now = p.get("Price")
+            pct = round((float(was)-float(now))/float(was)*100, 1) if was and now else 0
+            print(f"  {p.get('Name','?')[:55]} - ${now} (was ${was}, {pct}% off)")
 
-    assert len(products) >= 500, f"FAIL: only {len(products)} specials found, expected >= 500"
-    print(f"\nPASS: {len(products)} specials found (>= 500 threshold)")
+    assert len(products) >= 500, f"FAIL: only {len(products)} specials"
+    print(f"\nPASS: {len(products)} specials found")
